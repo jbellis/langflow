@@ -1,5 +1,7 @@
 import uuid
-from typing import Any, List
+import hashlib
+import json
+from typing import Any, List, Dict
 from uuid import UUID
 
 import torch
@@ -7,6 +9,7 @@ from cassandra.cluster import ResultSet
 from colbert_live.colbert_live import ColbertLive
 from colbert_live.db.astra import AstraCQL
 from colbert_live.models import ColbertModel
+from langchain_core.documents import Document
 from langflow.base.vectorstores.model import LCVectorStoreComponent, check_cached_vector_store
 from langflow.custom.custom_component.component_with_cache import ComponentWithCache
 from langflow.io import (
@@ -21,22 +24,37 @@ from langflow.io import (
 from langflow.schema import Data
 from loguru import logger
 
+from base.langflow.inputs.input_mixin import SerializableFieldTypes
+
 
 class ColbertLiveDB(AstraCQL):
-    def __init__(self, keyspace: str, table: str, embedding_dim: int, astra_db_id: str, astra_token: str):
-        super().__init__(keyspace, embedding_dim, astra_db_id, astra_token, verbose=True)
+    def __init__(self, keyspace: str, table: str, embedding_dim: int, metadata_columns: Dict[str, SerializableFieldTypes], astra_endpoint: str, astra_token: str):
+        super().__init__(keyspace, embedding_dim, astra_endpoint=astra_endpoint, astra_token=astra_token, verbose=True)
         self.table = table
+        self.metadata_columns = metadata_columns
+
+    def _get_cql_type(self, python_type: type) -> str:
+        if python_type == int:
+            return "int"
+        elif python_type == float:
+            return "float"
+        elif python_type == bool:
+            return "boolean"
+        else:
+            assert python_type == str
+            return "text"
 
     def prepare(self, embedding_dim: int):
         # Create tables asynchronously
         futures = []
 
         # Create base table if it doesn't exist
+        metadata_columns_str = ", ".join([f"{col_name} {self._get_cql_type(col_type)}" for col_name, col_type in self.metadata_columns.items()])
         futures.append(self.session.execute_async(f"""
             CREATE TABLE IF NOT EXISTS {self.keyspace}.{self.table} (
                 record_id uuid PRIMARY KEY,
                 body text,
-                metadata map<text, text>
+                {metadata_columns_str}
             )
         """))
 
@@ -195,26 +213,70 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
         ),
     ]
 
+    def _infer_metadata(self, documents: List[Document]) -> Dict[str, type]:
+        metadata_columns = {}
+        for doc in documents:
+            for key, value in doc.metadata.items():
+                if key not in metadata_columns:
+                    if isinstance(value, int):
+                        metadata_columns[key] = int
+                    elif isinstance(value, float):
+                        metadata_columns[key] = float
+                    elif isinstance(value, bool):
+                        metadata_columns[key] = bool
+                    elif isinstance(value, str):
+                        metadata_columns[key] = str
+                    else:
+                        raise ValueError(f'Unsupported type {type(value)}')
+        return metadata_columns
+
+    def _get_metadata_digest(self, metadata_columns: Dict[str, SerializableFieldTypes]) -> str:
+        return hashlib.md5(json.dumps(metadata_columns, sort_keys=True).encode()).hexdigest()
+
     @check_cached_vector_store
     def build_vector_store(self):
-        cache_key = f"colbert_live_{self.keyspace}_{self.api_endpoint}"
+        documents = self._extract_documents()
+        metadata_columns = self._infer_metadata(documents)
+        metadata_digest = self._get_metadata_digest(metadata_columns)
+        cache_key = f"colbert_live_{self.keyspace}_{self.api_endpoint}_{metadata_digest}"
         
         colbert_live = self._shared_component_cache.get(cache_key)
         if colbert_live is None:
             try:
                 model = ColbertModel()
-                db = ColbertLiveDB(self.keyspace, model.dim, UUID(self.api_endpoint), self.token)
+                db = ColbertLiveDB(self.keyspace, self.table, model.dim, metadata_columns, self.api_endpoint, self.token)
                 colbert_live = ColbertLive(db, model)
                 self._shared_component_cache.set(cache_key, colbert_live)
             except Exception as e:
                 msg = f"Error initializing ColbertLive: {e}"
                 raise ValueError(msg) from e
 
-        self._add_documents_to_vector_store(colbert_live)
+            self._maybe_insert_documents(colbert_live, documents)
 
         return colbert_live
 
-    def _add_documents_to_vector_store(self, colbert_live):
+    def _maybe_insert_documents(self, colbert_live, documents):
+        if not documents:
+            logger.debug("No documents to add to the Vector Store.")
+            return
+
+        logger.debug(f"Adding {len(documents)} documents to the Vector Store.")
+        try:
+            bodies = [doc.page_content for doc in documents]
+            metadata_list = [doc.metadata for doc in documents]
+
+            # Generate embeddings for all documents
+            all_embeddings = colbert_live.encode_chunks(bodies)
+
+            # Insert the documents with embeddings
+            colbert_live.db.add_records(bodies, all_embeddings, metadata_list)
+
+            logger.debug(f"Successfully added {len(documents)} documents to the Vector Store.")
+        except Exception as e:
+            msg = f"Error adding documents to ColbertLive: {e}"
+            raise ValueError(msg) from e
+
+    def _extract_documents(self):
         documents = []
         for _input in self.ingest_data or []:
             if isinstance(_input, Data):
@@ -222,26 +284,7 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
             else:
                 msg = "Vector Store Inputs must be Data objects."
                 raise ValueError(msg)
-
-        if documents:
-            logger.debug(f"Adding {len(documents)} documents to the Vector Store.")
-            try:
-                for doc in documents:
-                    body = doc.page_content
-                    metadata = doc.metadata
-                    
-                    # Generate embeddings for the document
-                    embeddings = colbert_live.encode_chunks([body])
-                    
-                    # Add the document and its embeddings to the database
-                    colbert_live.db.add_records(body, embeddings[0], metadata)
-                    
-                logger.debug(f"Successfully added {len(documents)} documents to the Vector Store.")
-            except Exception as e:
-                msg = f"Error adding documents to ColbertLive: {e}"
-                raise ValueError(msg) from e
-        else:
-            logger.debug("No documents to add to the Vector Store.")
+        return documents
 
     def search_documents(self) -> List[Data]:
         colbert_live = self.build_vector_store()
