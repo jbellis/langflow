@@ -85,7 +85,7 @@ class ColbertLiveVectorStore(VectorStore):
 
 
 class ColbertLiveDB(AstraCQL):
-    def __init__(self, keyspace: str, table: str, embedding_dim: int, metadata_columns: Dict[str, SerializableFieldTypes], astra_endpoint: str, astra_token: str):
+    def __init__(self, keyspace: str, table: str, embedding_dim: int, metadata_columns: List[Tuple[str, type]], astra_endpoint: str, astra_token: str):
         super().__init__(keyspace, embedding_dim, astra_endpoint=astra_endpoint, astra_token=astra_token, verbose=True)
         self.table = table
         self.metadata_columns = metadata_columns
@@ -106,12 +106,12 @@ class ColbertLiveDB(AstraCQL):
         futures = []
 
         # Create base table if it doesn't exist
-        metadata_columns_str = ", ".join([f"{col_name} {self._get_cql_type(col_type)}" for col_name, col_type in self.metadata_columns.items()])
+        metadata_columns_create = ", ".join([f"{col_name} {self._get_cql_type(col_type)}" for col_name, col_type in self.metadata_columns])
         futures.append(self.session.execute_async(f"""
             CREATE TABLE IF NOT EXISTS {self.keyspace}.{self.table} (
                 record_id uuid PRIMARY KEY,
                 body text,
-                {metadata_columns_str}
+                {metadata_columns_create}
             )
         """))
 
@@ -138,8 +138,11 @@ class ColbertLiveDB(AstraCQL):
         """)
 
         # Prepare statements
+        metadata_columns_insert = ", ".join([col_name for col_name, _ in self.metadata_columns])
+        metadata_placeholders = ", ".join(["?"] * len(self.metadata_columns))
         self.insert_record_stmt = self.session.prepare(f"""
-            INSERT INTO {self.keyspace}.{self.table} (record_id, body, metadata) VALUES (?, ?, ?)
+            INSERT INTO {self.keyspace}.{self.table} (record_id, body, {metadata_columns_insert}) 
+            VALUES (?, ?, {metadata_placeholders})
         """)
         self.insert_embedding_stmt = self.session.prepare(f"""
             INSERT INTO {self.keyspace}.{self.table}_embeddings (record_id, embedding_id, embedding) VALUES (?, ?, ?)
@@ -158,15 +161,15 @@ class ColbertLiveDB(AstraCQL):
 
         print("Schema ready")
 
-    def add_records(self, bodies: List[str], embeddings: List[torch.Tensor], metadata: dict[str, str]):
+    def add_records(self, bodies: List[str], embeddings: List[torch.Tensor], metadata: List[Dict[str, str]]):
         record_id = uuid.uuid4()
-        L = [(record_id, num, body, metadata) for num, body in enumerate(bodies, start=1)]
-        self.session.execute_concurrent_with_args(self.insert_page_stmt, L)
+        record_vars = [(record_id, body, *[metadata.get(col_name, None) for col_name, _ in self.metadata_columns]) 
+                       for body, metadata in zip(bodies, metadata)]
+        self.session.execute_concurrent_with_args(self.insert_record_stmt, record_vars)
 
-        L = [(record_id, page_num, embedding_id, embedding)
-             for page_num in range(1, len(embeddings) + 1)
-             for embedding_id, embedding in enumerate(embeddings[page_num - 1])]
-        self.session.execute_concurrent_with_args(self.insert_embedding_stmt, L)
+        embedding_vars = [(record_id, i, embedding)
+                          for i, embedding in enumerate(embeddings)]
+        self.session.execute_concurrent_with_args(self.insert_embedding_stmt, embedding_vars)
 
         return record_id
 
@@ -270,7 +273,7 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
         ),
     ]
 
-    def _infer_metadata(self, documents: List[Document]) -> Dict[str, type]:
+    def _infer_metadata(self, documents: List[Document]) -> List[Tuple[str, type]]:
         metadata_columns = {}
         for doc in documents:
             for key, value in doc.metadata.items():
@@ -285,10 +288,10 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
                         metadata_columns[key] = str
                     else:
                         raise ValueError(f'Unsupported type {type(value)}')
-        return metadata_columns
+        return metadata_columns.items().sorted()
 
-    def _get_metadata_digest(self, metadata_columns: Dict[str, SerializableFieldTypes]) -> str:
-        return hashlib.md5(json.dumps(metadata_columns, sort_keys=True).encode()).hexdigest()
+    def _get_metadata_digest(self, metadata_columns: List[Tuple[str, SerializableFieldTypes]]) -> str:
+        return hashlib.md5(json.dumps(metadata_columns).encode()).hexdigest()
 
     @check_cached_vector_store
     def build_vector_store(self):
@@ -299,16 +302,11 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
         
         vector_store = self._shared_component_cache.get(cache_key)
         if vector_store is None:
-            try:
-                model = ColbertModel()
-                db = ColbertLiveDB(self.keyspace, self.table, model.dim, metadata_columns, self.api_endpoint, self.token)
-                colbert_live = ColbertLive(db, model)
-                vector_store = ColbertLiveVectorStore(colbert_live)
-                self._shared_component_cache.set(cache_key, vector_store)
-            except Exception as e:
-                msg = f"Error initializing ColbertLiveVectorStore: {e}"
-                raise ValueError(msg) from e
-
+            model = ColbertModel()
+            db = ColbertLiveDB(self.keyspace, self.table, model.dim, metadata_columns, self.api_endpoint, self.token)
+            colbert_live = ColbertLive(db, model)
+            vector_store = ColbertLiveVectorStore(colbert_live)
+            self._shared_component_cache.set(cache_key, vector_store)
             self._maybe_insert_documents(vector_store, documents)
 
         return vector_store
