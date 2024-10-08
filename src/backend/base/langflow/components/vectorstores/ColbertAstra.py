@@ -1,7 +1,7 @@
 import uuid
 import hashlib
 import json
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional, Iterable, Tuple
 from uuid import UUID
 
 import torch
@@ -10,6 +10,7 @@ from colbert_live.colbert_live import ColbertLive
 from colbert_live.db.astra import AstraCQL
 from colbert_live.models import ColbertModel
 from langchain_core.documents import Document
+from langchain.vectorstores.base import VectorStore
 from langflow.base.vectorstores.model import LCVectorStoreComponent, check_cached_vector_store
 from langflow.custom.custom_component.component_with_cache import ComponentWithCache
 from langflow.io import (
@@ -25,6 +26,62 @@ from langflow.schema import Data
 from loguru import logger
 
 from base.langflow.inputs.input_mixin import SerializableFieldTypes
+
+class ColbertLiveVectorStore(VectorStore):
+    def __init__(self, colbert_live: ColbertLive):
+        self.colbert_live = colbert_live
+
+    def add_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        **kwargs: Any,
+    ) -> List[str]:
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
+        
+        bodies = list(texts)
+        all_embeddings = self.colbert_live.encode_chunks(bodies)
+        
+        record_ids = []
+        for body, embedding, metadata in zip(bodies, all_embeddings, metadatas):
+            record_id = self.colbert_live.db.add_records([body], [embedding], metadata)
+            record_ids.append(str(record_id))
+        
+        return record_ids
+
+    def similarity_search(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> List[Document]:
+        query_embedding = self.colbert_live.encode_query(query)
+        results = self.colbert_live.db.search_with_metadata_filter(
+            query_embedding,
+            k,
+            kwargs.get("filter", None)
+        )
+        
+        documents = []
+        for record_id, score in results:
+            body, metadata = self.colbert_live.db.get_record_body(record_id)
+            documents.append(Document(page_content=body, metadata={**metadata, "score": score, "record_id": record_id}))
+        
+        return documents
+
+    def similarity_search_with_score(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> List[Tuple[Document, float]]:
+        documents = self.similarity_search(query, k, **kwargs)
+        return [(doc, doc.metadata["score"]) for doc in documents]
+
+    @classmethod
+    def from_texts(
+        cls,
+        texts: List[str],
+        embedding: Any,
+        metadatas: Optional[List[dict]] = None,
+        **kwargs: Any,
+    ) -> VectorStore:
+        raise NotImplementedError("ColbertLiveVectorStore does not support from_texts method")
 
 
 class ColbertLiveDB(AstraCQL):
@@ -240,40 +297,37 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
         metadata_digest = self._get_metadata_digest(metadata_columns)
         cache_key = f"colbert_live_{self.keyspace}_{self.api_endpoint}_{metadata_digest}"
         
-        colbert_live = self._shared_component_cache.get(cache_key)
-        if colbert_live is None:
+        vector_store = self._shared_component_cache.get(cache_key)
+        if vector_store is None:
             try:
                 model = ColbertModel()
                 db = ColbertLiveDB(self.keyspace, self.table, model.dim, metadata_columns, self.api_endpoint, self.token)
                 colbert_live = ColbertLive(db, model)
-                self._shared_component_cache.set(cache_key, colbert_live)
+                vector_store = ColbertLiveVectorStore(colbert_live)
+                self._shared_component_cache.set(cache_key, vector_store)
             except Exception as e:
-                msg = f"Error initializing ColbertLive: {e}"
+                msg = f"Error initializing ColbertLiveVectorStore: {e}"
                 raise ValueError(msg) from e
 
-            self._maybe_insert_documents(colbert_live, documents)
+            self._maybe_insert_documents(vector_store, documents)
 
-        return colbert_live
+        return vector_store
 
-    def _maybe_insert_documents(self, colbert_live, documents):
+    def _maybe_insert_documents(self, vector_store, documents):
         if not documents:
             logger.debug("No documents to add to the Vector Store.")
             return
 
         logger.debug(f"Adding {len(documents)} documents to the Vector Store.")
         try:
-            bodies = [doc.page_content for doc in documents]
-            metadata_list = [doc.metadata for doc in documents]
+            texts = [doc.page_content for doc in documents]
+            metadatas = [doc.metadata for doc in documents]
 
-            # Generate embeddings for all documents
-            all_embeddings = colbert_live.encode_chunks(bodies)
-
-            # Insert the documents with embeddings
-            colbert_live.db.add_records(bodies, all_embeddings, metadata_list)
+            vector_store.add_texts(texts, metadatas)
 
             logger.debug(f"Successfully added {len(documents)} documents to the Vector Store.")
         except Exception as e:
-            msg = f"Error adding documents to ColbertLive: {e}"
+            msg = f"Error adding documents to ColbertLiveVectorStore: {e}"
             raise ValueError(msg) from e
 
     def _extract_documents(self):
