@@ -35,7 +35,7 @@ class ColbertLiveDB(AstraCQL):
         futures.append(self.session.execute_async(f"""
             CREATE TABLE IF NOT EXISTS {self.keyspace}.{self.table} (
                 record_id uuid PRIMARY KEY,
-                content text,
+                body text,
                 metadata map<text, text>
             )
         """))
@@ -64,7 +64,7 @@ class ColbertLiveDB(AstraCQL):
 
         # Prepare statements
         self.insert_record_stmt = self.session.prepare(f"""
-            INSERT INTO {self.keyspace}.{self.table} (record_id, content, metadata) VALUES (?, ?, ?)
+            INSERT INTO {self.keyspace}.{self.table} (record_id, body, metadata) VALUES (?, ?, ?)
         """)
         self.insert_embedding_stmt = self.session.prepare(f"""
             INSERT INTO {self.keyspace}.{self.table}_embeddings (record_id, embedding_id, embedding) VALUES (?, ?, ?)
@@ -83,9 +83,9 @@ class ColbertLiveDB(AstraCQL):
 
         print("Schema ready")
 
-    def add_record(self, pages: list[bytes], embeddings: list[torch.Tensor], metadata: dict[str, str]):
+    def add_records(self, bodies: List[str], embeddings: List[torch.Tensor], metadata: dict[str, str]):
         record_id = uuid.uuid4()
-        L = [(record_id, num, body, metadata) for num, body in enumerate(pages, start=1)]
+        L = [(record_id, num, body, metadata) for num, body in enumerate(bodies, start=1)]
         self.session.execute_concurrent_with_args(self.insert_page_stmt, L)
 
         L = [(record_id, page_num, embedding_id, embedding)
@@ -96,15 +96,14 @@ class ColbertLiveDB(AstraCQL):
         return record_id
 
     def process_ann_rows(self, result: ResultSet) -> List[tuple[Any, float]]:
-        return [((row.record_id, row.page_num), row.similarity) for row in result]
+        return [(row.record_id, row.similarity) for row in result]
 
     def process_chunk_rows(self, result: ResultSet) -> List[torch.Tensor]:
         return [torch.tensor(row.embedding) for row in result]
 
-    def get_page_body(self, chunk_pk: tuple) -> bytes:
-        record_id, page_num = chunk_pk
-        query = f"SELECT body, metadata FROM {self.keyspace}.pages WHERE record_id = %s AND num = %s"
-        result = self.session.execute(query, (record_id, page_num))
+    def get_record_body(self, record_id: Any) -> tuple[str, dict[str, str]]:
+        query = f"SELECT body, metadata FROM {self.keyspace}.{self.table} WHERE record_id = %s"
+        result = self.session.execute(query, (record_id,))
         row = result.one()
         return row.body, row.metadata
 
@@ -112,13 +111,10 @@ class ColbertLiveDB(AstraCQL):
         ann_results = self.query_ann(embeddings, limit * 2)  # Query more results to account for filtering
         filtered_results = []
 
-        for chunk_results in ann_results:
-            for chunk_pk, similarity in chunk_results:
-                _, metadata = self.get_page_body(chunk_pk)
-                if metadata_filter is None or all(metadata.get(k) == v for k, v in metadata_filter.items()):
-                    filtered_results.append((chunk_pk, similarity))
-                if len(filtered_results) == limit:
-                    break
+        for record_id, similarity in ann_results:
+            body, metadata = self.get_record_body(record_id)
+            if metadata_filter is None or all(metadata.get(k) == v for k, v in metadata_filter.items()):
+                filtered_results.append((record_id, similarity))
             if len(filtered_results) == limit:
                 break
 
@@ -130,9 +126,10 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
     description: str = "An Astra Vector Store using ColbertLive with search capabilities"
     documentation: str = """
     ColbertAstra will infer an appropriate base table schema and create it if ingest_data is specified.
-    Otherwise, ColbertAstra assumes that you have created it already.  By convention, the base table
-    must have a single-column primary key named `record_id`, which can be of any type.  When ColbertAstra
-    creates the base table, it uses UUID as the PK type.
+    Otherwise, ColbertAstra assumes that you have created it already.  
+    - By convention, the base table must have a single-column primary key named `record_id`, which can be of any type.  
+      When ColbertAstra creates the base table, it uses UUID as the PK type.
+    - The record body is stored in a column named `body` of type `text`.
       
     ColbertAstra always manages its embeddings table, which is named {base_table}_embeddingshas.  It has three
     fields:
@@ -230,18 +227,14 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
             logger.debug(f"Adding {len(documents)} documents to the Vector Store.")
             try:
                 for doc in documents:
-                    content = doc.page_content
+                    body = doc.page_content
                     metadata = doc.metadata
                     
                     # Generate embeddings for the document
-                    embeddings = colbert_live.encode_chunks([content])
+                    embeddings = colbert_live.encode_chunks([body])
                     
                     # Add the document and its embeddings to the database
-                    record_id = uuid.uuid4()
-                    colbert_live.db.session.execute(colbert_live.db.insert_record_stmt, (record_id, content, metadata))
-                    
-                    for embedding_id, embedding in enumerate(embeddings[0]):
-                        colbert_live.db.session.execute(colbert_live.db.insert_embedding_stmt, (record_id, embedding_id, embedding.tolist()))
+                    colbert_live.db.add_records(body, embeddings[0], metadata)
                     
                 logger.debug(f"Successfully added {len(documents)} documents to the Vector Store.")
             except Exception as e:
@@ -273,9 +266,9 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent, ComponentWithCach
 
             # Convert results to Data objects
             data = []
-            for chunk_pk, score in results:
-                page_body, metadata = colbert_live.db.get_page_body(chunk_pk)
-                data.append(Data(content=page_body, metadata={**metadata, "score": score, "chunk_pk": chunk_pk}))
+            for record_id, score in results:
+                body, metadata = colbert_live.db.get_record_body(record_id)
+                data.append(Data(content=body, metadata={**metadata, "score": score, "record_id": record_id}))
 
             self.status = data
             return data
