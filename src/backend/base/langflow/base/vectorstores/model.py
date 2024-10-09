@@ -41,20 +41,6 @@ class LCVectorStoreComponent(Component):
     # Used to ensure a single vector store is built for each run of the flow
     _cached_vector_store: VectorStore | None = None
 
-    def __init_subclass__(cls, **kwargs):
-        """
-        Enforces the check cached decorator on all subclasses
-        """
-        super().__init_subclass__(**kwargs)
-        if hasattr(cls, "build_vector_store"):
-            method = cls.build_vector_store
-            if not hasattr(method, "_is_cached_vector_store_checked"):
-                msg = (
-                    f"The method 'build_vector_store' in class {cls.__name__} "
-                    "must be decorated with @check_cached_vector_store"
-                )
-                raise TypeError(msg)
-
     trace_type = "retriever"
     outputs = [
         Output(
