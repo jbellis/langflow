@@ -32,15 +32,9 @@ class ColbertLiveVectorStore(VectorStore):
 
         return record_ids
 
-    def similarity_search(
-            self, query: str, k: int = 4, **kwargs: Any
-    ) -> List[Document]:
+    def similarity_search(self, query: str, k: int = 4, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
         query_embedding = self.colbert_live.encode_query(query)
-        results = self.colbert_live.db.search_with_metadata_filter(
-            query_embedding,
-            k,
-            kwargs.get("filter", None)
-        )
+        results = self.colbert_live.search(query_embedding, k, filter=filter or {})
 
         documents = []
         for record_id, score in results:
@@ -48,12 +42,6 @@ class ColbertLiveVectorStore(VectorStore):
             documents.append(Document(page_content=body, metadata={**metadata, "score": score, "record_id": record_id}))
 
         return documents
-
-    def similarity_search_with_score(
-            self, query: str, k: int = 4, **kwargs: Any
-    ) -> List[Tuple[Document, float]]:
-        documents = self.similarity_search(query, k, **kwargs)
-        return [(doc, doc.metadata["score"]) for doc in documents]
 
     @classmethod
     def from_texts(
@@ -122,20 +110,22 @@ class ColbertLiveDB(AstraCQL):
         """)
 
         # Prepare statements
-        metadata_columns_insert = ", ".join([col_name for col_name, _ in self.metadata_columns])
-        metadata_placeholders = ", ".join(["?"] * len(self.metadata_columns))
+        metadata_insert_columns = ", ".join([col_name for col_name, _ in self.metadata_columns])
+        metadata_insert_binds = ", ".join(["?"] * len(self.metadata_columns))
         self.insert_record_stmt = self.session.prepare(f"""
-            INSERT INTO {self.keyspace}.{self.table} (record_id, body, {metadata_columns_insert}) 
-            VALUES (?, ?, {metadata_placeholders})
+            INSERT INTO {self.keyspace}.{self.table} (record_id, body, {metadata_insert_columns}) 
+            VALUES (?, ?, {metadata_insert_binds})
         """)
         self.insert_embedding_stmt = self.session.prepare(f"""
             INSERT INTO {self.keyspace}.{self.table}_embeddings (record_id, embedding_id, embedding) VALUES (?, ?, ?)
         """)
 
         index_future.result()
+        metadata_select_where = " AND ".join([f"metadata.{col_name} = ?" for col_name, _ in self.metadata_columns])
         self.query_ann_stmt = self.session.prepare(f"""
             SELECT record_id, similarity_cosine(embedding, ?) AS similarity
             FROM {self.keyspace}.{self.table}_embeddings
+            {metadata_select_where}
             ORDER BY embedding ANN OF ?
             LIMIT ?
         """)
@@ -168,18 +158,3 @@ class ColbertLiveDB(AstraCQL):
         result = self.session.execute(query, (record_id,))
         row = result.one()
         return row.body, row.metadata
-
-    def search_with_metadata_filter(self, embeddings: torch.Tensor, limit: int, metadata_filter: dict[str, str] = None):
-        ann_results = self.query_ann(embeddings, limit * 2)  # Query more results to account for filtering
-        filtered_results = []
-
-        for record_id, similarity in ann_results:
-            body, metadata = self.get_record_body(record_id)
-            if metadata_filter is None or all(metadata.get(k) == v for k, v in metadata_filter.items()):
-                filtered_results.append((record_id, similarity))
-            if len(filtered_results) == limit:
-                break
-
-        return filtered_results[:limit]
-
-

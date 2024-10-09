@@ -6,6 +6,7 @@ from colbert_live.colbert_live import ColbertLive
 from colbert_live.models import ColbertModel
 from langchain_core.documents import Document
 from langflow.base.vectorstores.model import LCVectorStoreComponent, check_cached_vector_store
+from langflow.helpers import docs_to_data
 from langflow.io import (
     DataInput,
     HandleInput,
@@ -77,12 +78,6 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent):
             display_name="Ingest Data",
             is_list=True,
         ),
-        HandleInput(
-            name="embedding",
-            display_name="Embedding Model",
-            input_types=["Embeddings"],
-            info="Allows an embedding model configuration.",
-        ),
         IntInput(
             name="number_of_results",
             display_name="Number of Results",
@@ -119,16 +114,15 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent):
                         raise ValueError(f'Unsupported type {type(value)}')
         return metadata_columns.items().sorted()
 
-    def _get_metadata_digest(self, metadata_columns: List[Tuple[str, SerializableFieldTypes]]) -> str:
-        return hashlib.md5(json.dumps(metadata_columns).encode()).hexdigest()
-
-    @check_cached_vector_store
+    # deliberately does not use super's check_cached_vector_store, preferring the shared component cache
     def build_vector_store(self):
+        # this is fragile -- if your first instantiation doesn't tell us the metadata, then the table will
+        # be created without it and future ingests will be SOL.  There's no real way around this though
+        # without creating a typed metadata input field though which is out of scope for the initial release.
         documents = self._extract_documents()
         metadata_columns = self._infer_metadata(documents)
-        metadata_digest = self._get_metadata_digest(metadata_columns)
-        cache_key = f"colbert_live_{self.keyspace}_{self.api_endpoint}_{metadata_digest}"
-        
+
+        cache_key = f"colbert_live_{self.keyspace}_{self.table}_{self.api_endpoint}"
         vector_store = self._shared_component_cache.get(cache_key)
         if vector_store is None:
             model = ColbertModel()
@@ -136,7 +130,8 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent):
             colbert_live = ColbertLive(db, model)
             vector_store = ColbertLiveVectorStore(colbert_live)
             self._shared_component_cache.set(cache_key, vector_store)
-            self._maybe_insert_documents(vector_store, documents)
+
+        self._maybe_insert_documents(vector_store, documents)
 
         return vector_store
 
@@ -160,44 +155,31 @@ class ColbertAstraVectorStoreComponent(LCVectorStoreComponent):
     def _extract_documents(self):
         documents = []
         for _input in self.ingest_data or []:
-            if isinstance(_input, Data):
-                documents.append(_input.to_lc_document())
-            else:
+            if not isinstance(_input, Data):
                 msg = "Vector Store Inputs must be Data objects."
                 raise ValueError(msg)
+            documents.append(_input.to_lc_document())
         return documents
 
     def search_documents(self) -> List[Data]:
-        colbert_live = self.build_vector_store()
+        vector_store = self.build_vector_store()
 
         logger.debug(f"Search input: {self.search_input}")
         logger.debug(f"Number of results: {self.number_of_results}")
         logger.debug(f"Search filter: {self.search_filter}")
 
-        if self.search_input and isinstance(self.search_input, str) and self.search_input.strip():
-            try:
-                query_embedding = colbert_live.encode_query(self.search_input)
-                results = colbert_live.db.search_with_metadata_filter(
-                    query_embedding,
-                    self.number_of_results,
-                    self.search_filter
-                )
-            except Exception as e:
-                msg = f"Error performing search in ColbertLive: {e}"
-                raise ValueError(msg) from e
+        if not self.search_input or not isinstance(self.search_input, str) or not self.search_input.strip():
+            logger.debug("No search input provided. Skipping search.")
+            return []
 
-            logger.debug(f"Retrieved documents: {len(results)}")
+        docs = vector_store.similarity_search(self.search_input, k=self.number_of_results, filter=self.search_filter)
+        logger.debug(f"Retrieved documents: {len(docs)}")
 
-            # Convert results to Data objects
-            data = []
-            for record_id, score in results:
-                body, metadata = colbert_live.db.get_record_body(record_id)
-                data.append(Data(content=body, metadata={**metadata, "score": score, "record_id": record_id}))
+        # Convert results to Data objects
+        data = docs_to_data(docs)
 
-            self.status = data
-            return data
-        logger.debug("No search input provided. Skipping search.")
-        return []
+        self.status = data
+        return data
 
     def get_retriever_kwargs(self):
         return {
